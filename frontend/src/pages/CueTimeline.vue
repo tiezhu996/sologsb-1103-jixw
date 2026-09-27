@@ -10,6 +10,7 @@ import {
   NInputNumber,
   NModal,
   NSelect,
+  NTag,
   useDialog,
   useMessage
 } from 'naive-ui'
@@ -50,6 +51,8 @@ const scopeOptions = [
 const fixtures = computed(() => fixtureStore.sortedFixturesOfSession(sessionId.value))
 const cueNoList = computed(() => cues.value.map((cue) => cue.cueNo))
 const totalDuration = computed(() => summary.value.totalSec)
+/** 已锁定、批量偏移时保持原样的 Cue 条数 */
+const lockedCount = computed(() => cues.value.filter((cue) => cue.locked).length)
 
 /** 通道芯片的展示数据 */
 interface CueChannelChip {
@@ -131,7 +134,8 @@ async function submitCreate(): Promise<void> {
     fadeInSec: createForm.fadeInSec ?? 0,
     fadeOutSec: createForm.fadeOutSec ?? 0,
     holdSec: createForm.holdSec ?? 0,
-    note: createForm.note.trim()
+    note: createForm.note.trim(),
+    locked: false
   })
   message.success(`已插入 ${normalizeCueNo(createForm.cueNo)}`)
   showCreate.value = false
@@ -147,9 +151,23 @@ function handleScopeChange(value: string | number | Array<string | number> | nul
 
 async function submitShift(): Promise<void> {
   const delta = shiftForm.deltaSec ?? 0
-  const affected = await cueStore.shiftFades(sessionId.value, delta, shiftForm.scope)
-  message.success(`已偏移 ${affected} 条 Cue 的过渡时间（${delta > 0 ? '+' : ''}${delta}s）`)
+  const result = await cueStore.shiftFades(sessionId.value, delta, shiftForm.scope)
+  if (!result.applied) {
+    const pairs = result.conflicts
+      .map((item) => `${item.fromCueNo} → ${item.toCueNo}（${formatSeconds(item.gapSec)}）`)
+      .join('、')
+    message.error(`偏移后 ${pairs} 的渐暗 + 渐亮不足 1s，本次偏移未生效`)
+    return
+  }
+  const text = `已偏移 ${result.shifted} 条、跳过 ${result.skipped} 条锁定 Cue（${delta > 0 ? '+' : ''}${delta}s）`
+  if (result.shifted === 0) message.warning(text)
+  else message.success(text)
   showShift.value = false
+}
+
+/* ---------------- 锁定开关 ---------------- */
+async function toggleLock(cue: Cue): Promise<void> {
+  await cueStore.toggleLock(cue.id)
 }
 
 /* ---------------- 行内编辑（失焦提交） ---------------- */
@@ -408,7 +426,8 @@ function channelFilterDuplicate(fixtureId: string): boolean {
           class="cue-row"
           :class="{
             'cue-row--dragging': draggingId === cue.id,
-            'cue-row--over': dragOverId === cue.id
+            'cue-row--over': dragOverId === cue.id,
+            'cue-row--locked': cue.locked
           }"
           @dragover.prevent="onDragOver(cue)"
           @drop.prevent="onDrop(cue)"
@@ -418,6 +437,15 @@ function channelFilterDuplicate(fixtureId: string): boolean {
               ⠿
             </span>
             <span class="cue-row__index mono">{{ index + 1 }}</span>
+            <NButton
+              size="tiny"
+              quaternary
+              :type="cue.locked ? 'warning' : 'default'"
+              :title="cue.locked ? '已锁定：批量偏移时保持原样，点击解锁' : '未锁定：点击锁定后批量偏移时保持原样'"
+              @click="toggleLock(cue)"
+            >
+              {{ cue.locked ? '🔒' : '🔓' }}
+            </NButton>
           </div>
 
           <div class="cue-row__main">
@@ -443,6 +471,7 @@ function channelFilterDuplicate(fixtureId: string): boolean {
                 style="width: 118px"
                 @update:value="(value) => commitTrigger(cue, value)"
               />
+              <NTag v-if="cue.locked" size="small" type="warning" :bordered="false">已锁定</NTag>
               <NButton size="tiny" type="primary" ghost @click="goLevels(cue.id)">
                 电平编辑（{{ levelStore.levelsOfCue(cue.id).length }}）
               </NButton>
@@ -585,7 +614,10 @@ function channelFilterDuplicate(fixtureId: string): boolean {
           <NSelect :value="shiftForm.scope" :options="scopeOptions" @update:value="handleScopeChange" />
         </NFormItem>
       </NForm>
-      <p class="shift-tip">将对本场全部 {{ cues.length }} 条 Cue 生效，结果下限为 0 秒。</p>
+      <p class="shift-tip">
+        将对本场 {{ cues.length - lockedCount }} 条未锁定 Cue 生效<template v-if="lockedCount > 0">，{{ lockedCount }}
+          条已锁定保持原样</template>，结果下限为 0 秒；若偏移后出现渐暗 + 渐亮不足 1s 的硬切衔接，本次将整体不生效。
+      </p>
       <template #footer>
         <div class="modal-footer">
           <NButton @click="showShift = false">取消</NButton>
@@ -655,6 +687,11 @@ function channelFilterDuplicate(fixtureId: string): boolean {
 
 .cue-row--over {
   border-color: rgba(242, 181, 68, 0.75);
+}
+
+.cue-row--locked {
+  border-color: rgba(242, 181, 68, 0.32);
+  background: rgba(242, 181, 68, 0.04);
 }
 
 .cue-row__lead {

@@ -22,6 +22,8 @@ export interface Cue {
   holdSec: number
   /** 备注 */
   note: string
+  /** 锁定后批量偏移过渡时间时保持原样（仅本地状态，旧数据升级按未锁定处理） */
+  locked: boolean
   /** 时间轴落库位次，拖拽调整先后时写回 */
   orderIndex: number
   createdAt: number
@@ -66,6 +68,7 @@ export function createEmptyCueDraft(sessionId: string, cueNo: string): CueDraft 
     fadeInSec: 3,
     fadeOutSec: 3,
     holdSec: 5,
-    note: ''
+    note: '',
+    locked: false
   }
 }

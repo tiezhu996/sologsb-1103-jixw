@@ -1,9 +1,10 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import type { Cue, CueDraft } from '@/types/cue'
+import type { AdjacentTransition, Cue, CueDraft } from '@/types/cue'
 import { db } from '@/utils/db'
 import { createId } from '@/utils/id'
 import { orderIndexMap, compareCueNo, sortCues, suggestInsertIndex, suggestNextCueNo } from '@/utils/cueOrder'
+import { sumCues } from '@/utils/fade'
 import { useLevelStore } from '@/stores/levelStore'
 
 /** Cue 可更新字段 */
@@ -11,6 +12,18 @@ export type CuePatch = Partial<Omit<Cue, 'id' | 'sessionId' | 'createdAt'>>
 
 /** 过渡时间批量偏移的作用范围 */
 export type FadeShiftScope = 'in' | 'out' | 'both'
+
+/** 批量偏移过渡时间的结果 */
+export interface FadeShiftResult {
+  /** 是否已落库生效；false 表示偏移后会出现硬切衔接，本次整体未做任何修改 */
+  applied: boolean
+  /** 实际偏移的 Cue 条数（未生效时为 0） */
+  shifted: number
+  /** 因锁定而跳过的 Cue 条数 */
+  skipped: number
+  /** 偏移后会出现的硬切衔接（渐暗 + 渐亮 < 1s），仅 applied 为 false 时非空 */
+  conflicts: AdjacentTransition[]
+}
 
 /**
  * Cue 提示点仓库：维护 Cue 时间轴顺序（orderIndex 落库）与排演表勾选导出集合。
@@ -71,6 +84,7 @@ export const useCueStore = defineStore('cue', () => {
       fadeOutSec: draft.fadeOutSec,
       holdSec: draft.holdSec,
       note: draft.note,
+      locked: draft.locked,
       orderIndex: insertIndex + 1,
       createdAt: now,
       updatedAt: now
@@ -129,7 +143,8 @@ export const useCueStore = defineStore('cue', () => {
       fadeInSec: source.fadeInSec,
       fadeOutSec: source.fadeOutSec,
       holdSec: source.holdSec,
-      note: source.note
+      note: source.note,
+      locked: false
     })
     const ordered = sortedCuesOfSession(source.sessionId)
     const sourceIndex = ordered.findIndex((cue) => cue.id === source.id)
@@ -158,20 +173,44 @@ export const useCueStore = defineStore('cue', () => {
     return true
   }
 
-  /** 批量偏移一场戏内全部 Cue 的过渡时间，结果下限为 0 */
-  async function shiftFades(sessionId: string, deltaSec: number, scope: FadeShiftScope): Promise<number> {
+  /**
+   * 批量偏移一场戏内未锁定 Cue 的过渡时间，结果下限为 0。
+   * 锁定的 Cue 保持原值，并照原值参与相邻衔接计算。偏移后若出现渐暗 + 渐亮不足 1 秒的
+   * 硬切衔接，本次整体不生效（一条都不落库），并把冲突的相邻两条返回给调用方。
+   */
+  async function shiftFades(sessionId: string, deltaSec: number, scope: FadeShiftScope): Promise<FadeShiftResult> {
     const targets = sortedCuesOfSession(sessionId)
-    if (targets.length === 0) return 0
+    if (targets.length === 0) return { applied: true, shifted: 0, skipped: 0, conflicts: [] }
+    const skipped = targets.filter((cue) => cue.locked).length
+    // 全部锁定时没有任何数值会变化，无需再做硬切校验
+    if (skipped === targets.length) return { applied: true, shifted: 0, skipped, conflicts: [] }
+
     const now = Date.now()
     const shifted = targets.map<Cue>((cue) => {
+      if (cue.locked) return cue
       const nextIn = scope === 'out' ? cue.fadeInSec : Math.max(0, Math.round((cue.fadeInSec + deltaSec) * 10) / 10)
       const nextOut = scope === 'in' ? cue.fadeOutSec : Math.max(0, Math.round((cue.fadeOutSec + deltaSec) * 10) / 10)
       return { ...cue, fadeInSec: nextIn, fadeOutSec: nextOut, updatedAt: now }
     })
-    await db.cues.bulkPut(shifted)
-    const patched = new Map(shifted.map((cue) => [cue.id, cue]))
+
+    // 锁定 Cue 按原值参与衔接计算：校验偏移后的完整场次
+    const conflicts = sumCues(shifted).adjacent.filter((item) => item.overlap)
+    if (conflicts.length > 0) {
+      return { applied: false, shifted: 0, skipped, conflicts }
+    }
+
+    const changed = shifted.filter((cue) => !cue.locked)
+    await db.cues.bulkPut(changed)
+    const patched = new Map(changed.map((cue) => [cue.id, cue]))
     cues.value = cues.value.map((cue) => patched.get(cue.id) ?? cue)
-    return shifted.length
+    return { applied: true, shifted: changed.length, skipped, conflicts: [] }
+  }
+
+  /** 切换锁定状态：锁定的 Cue 在批量偏移时保持原样 */
+  async function toggleLock(id: string): Promise<void> {
+    const target = cueById(id)
+    if (!target) return
+    await updateCue(id, { locked: !target.locked })
   }
 
   /** 把当前顺序写入 orderIndex */
@@ -271,6 +310,7 @@ export const useCueStore = defineStore('cue', () => {
     duplicateCue,
     copyPreviousParams,
     shiftFades,
+    toggleLock,
     persistOrder,
     reorderCues,
     sortByCueNo,
