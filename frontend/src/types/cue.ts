@@ -22,6 +22,8 @@ export interface Cue {
   holdSec: number
   /** 备注 */
   note: string
+  /** 锁定后批量偏移保持原样，但仍按原值参与相邻衔接计算 */
+  locked: boolean
   /** 时间轴落库位次，拖拽调整先后时写回 */
   orderIndex: number
   createdAt: number
@@ -29,9 +31,11 @@ export interface Cue {
 }
 
 /** 新建 Cue 时提交的字段集合 */
-export type CueDraft = Omit<Cue, 'id' | 'createdAt' | 'updatedAt' | 'orderIndex'> & {
+export type CueDraft = Omit<Cue, 'id' | 'createdAt' | 'updatedAt' | 'orderIndex' | 'locked'> & {
   /** 不传时由 store 按 cueNo 自动定位落库位次 */
   orderIndex?: number
+  /** 不传时按未锁定处理 */
+  locked?: boolean
 }
 
 /** 相邻两条 Cue 之间的过渡衔接 */

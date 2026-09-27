@@ -1,8 +1,9 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import type { Cue, CueDraft } from '@/types/cue'
+import type { AdjacentTransition, Cue, CueDraft } from '@/types/cue'
 import { db } from '@/utils/db'
 import { createId } from '@/utils/id'
+import { sumCues } from '@/utils/fade'
 import { orderIndexMap, compareCueNo, sortCues, suggestInsertIndex, suggestNextCueNo } from '@/utils/cueOrder'
 import { useLevelStore } from '@/stores/levelStore'
 
@@ -11,6 +12,24 @@ export type CuePatch = Partial<Omit<Cue, 'id' | 'sessionId' | 'createdAt'>>
 
 /** 过渡时间批量偏移的作用范围 */
 export type FadeShiftScope = 'in' | 'out' | 'both'
+
+/** 批量偏移已生效 */
+export interface FadeShiftApplied {
+  ok: true
+  /** 本次实际偏移的 Cue 条数 */
+  shifted: number
+  /** 因锁定而保持原样的 Cue 条数 */
+  skipped: number
+}
+
+/** 批量偏移被拦截：偏移后会出现渐暗 + 渐亮不足 1 秒的硬切衔接 */
+export interface FadeShiftRejected {
+  ok: false
+  /** 预演中出现硬切的相邻衔接（锁定 Cue 按原值参与计算） */
+  hardCuts: AdjacentTransition[]
+}
+
+export type FadeShiftResult = FadeShiftApplied | FadeShiftRejected
 
 /**
  * Cue 提示点仓库：维护 Cue 时间轴顺序（orderIndex 落库）与排演表勾选导出集合。
@@ -71,6 +90,7 @@ export const useCueStore = defineStore('cue', () => {
       fadeOutSec: draft.fadeOutSec,
       holdSec: draft.holdSec,
       note: draft.note,
+      locked: draft.locked ?? false,
       orderIndex: insertIndex + 1,
       createdAt: now,
       updatedAt: now
@@ -129,7 +149,8 @@ export const useCueStore = defineStore('cue', () => {
       fadeInSec: source.fadeInSec,
       fadeOutSec: source.fadeOutSec,
       holdSec: source.holdSec,
-      note: source.note
+      note: source.note,
+      locked: source.locked
     })
     const ordered = sortedCuesOfSession(source.sessionId)
     const sourceIndex = ordered.findIndex((cue) => cue.id === source.id)
@@ -158,20 +179,30 @@ export const useCueStore = defineStore('cue', () => {
     return true
   }
 
-  /** 批量偏移一场戏内全部 Cue 的过渡时间，结果下限为 0 */
-  async function shiftFades(sessionId: string, deltaSec: number, scope: FadeShiftScope): Promise<number> {
+  /**
+   * 批量偏移一场戏内 Cue 的过渡时间，结果下限为 0。
+   * 锁定的 Cue 保持原样（仍按原值参与相邻衔接计算）；
+   * 先整体预演，偏移后若出现渐暗 + 渐亮不足 1 秒的硬切衔接，则整个不生效并返回涉事衔接。
+   */
+  async function shiftFades(sessionId: string, deltaSec: number, scope: FadeShiftScope): Promise<FadeShiftResult> {
     const targets = sortedCuesOfSession(sessionId)
-    if (targets.length === 0) return 0
+    if (targets.length === 0) return { ok: true, shifted: 0, skipped: 0 }
     const now = Date.now()
-    const shifted = targets.map<Cue>((cue) => {
+    const preview = targets.map<Cue>((cue) => {
+      if (cue.locked) return cue
       const nextIn = scope === 'out' ? cue.fadeInSec : Math.max(0, Math.round((cue.fadeInSec + deltaSec) * 10) / 10)
       const nextOut = scope === 'in' ? cue.fadeOutSec : Math.max(0, Math.round((cue.fadeOutSec + deltaSec) * 10) / 10)
       return { ...cue, fadeInSec: nextIn, fadeOutSec: nextOut, updatedAt: now }
     })
-    await db.cues.bulkPut(shifted)
-    const patched = new Map(shifted.map((cue) => [cue.id, cue]))
+
+    const hardCuts = sumCues(preview).adjacent.filter((item) => item.overlap)
+    if (hardCuts.length > 0) return { ok: false, hardCuts }
+
+    const changed = preview.filter((cue) => !cue.locked)
+    await db.cues.bulkPut(changed)
+    const patched = new Map(changed.map((cue) => [cue.id, cue]))
     cues.value = cues.value.map((cue) => patched.get(cue.id) ?? cue)
-    return shifted.length
+    return { ok: true, shifted: changed.length, skipped: preview.length - changed.length }
   }
 
   /** 把当前顺序写入 orderIndex */

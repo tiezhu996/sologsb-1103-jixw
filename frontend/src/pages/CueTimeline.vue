@@ -50,6 +50,7 @@ const scopeOptions = [
 const fixtures = computed(() => fixtureStore.sortedFixturesOfSession(sessionId.value))
 const cueNoList = computed(() => cues.value.map((cue) => cue.cueNo))
 const totalDuration = computed(() => summary.value.totalSec)
+const lockedCount = computed(() => cues.value.filter((cue) => cue.locked).length)
 
 /** 通道芯片的展示数据 */
 interface CueChannelChip {
@@ -147,8 +148,16 @@ function handleScopeChange(value: string | number | Array<string | number> | nul
 
 async function submitShift(): Promise<void> {
   const delta = shiftForm.deltaSec ?? 0
-  const affected = await cueStore.shiftFades(sessionId.value, delta, shiftForm.scope)
-  message.success(`已偏移 ${affected} 条 Cue 的过渡时间（${delta > 0 ? '+' : ''}${delta}s）`)
+  const result = await cueStore.shiftFades(sessionId.value, delta, shiftForm.scope)
+  if (!result.ok) {
+    const pairs = result.hardCuts
+      .map((item) => `${item.fromCueNo} → ${item.toCueNo}（渐暗 + 渐亮仅 ${formatSeconds(item.gapSec)}）`)
+      .join('；')
+    message.error(`偏移未生效：${pairs} 不足 1 秒，已成硬切衔接，请先调整这两条 Cue`)
+    return
+  }
+  const deltaText = `${delta > 0 ? '+' : ''}${delta}s`
+  message.success(`已偏移 ${result.shifted} 条 Cue（${deltaText}），跳过 ${result.skipped} 条锁定 Cue`)
   showShift.value = false
 }
 
@@ -224,6 +233,10 @@ function existingNosOf(cue: Cue): string[] {
 }
 
 /* ---------------- 行内动作 ---------------- */
+async function toggleLock(cue: Cue): Promise<void> {
+  await cueStore.updateCue(cue.id, { locked: !cue.locked })
+}
+
 async function duplicateCue(cue: Cue): Promise<void> {
   const created = await cueStore.duplicateCue(cue.id)
   if (created) message.success(`已复制为 ${created.cueNo}`)
@@ -408,7 +421,8 @@ function channelFilterDuplicate(fixtureId: string): boolean {
           class="cue-row"
           :class="{
             'cue-row--dragging': draggingId === cue.id,
-            'cue-row--over': dragOverId === cue.id
+            'cue-row--over': dragOverId === cue.id,
+            'cue-row--locked': cue.locked
           }"
           @dragover.prevent="onDragOver(cue)"
           @drop.prevent="onDrop(cue)"
@@ -427,6 +441,7 @@ function channelFilterDuplicate(fixtureId: string): boolean {
                 :existing-nos="existingNosOf(cue)"
                 @commit="(value) => commitCueNo(cue, value)"
               />
+              <span v-if="cue.locked" class="cue-row__lock-badge" title="已锁定：批量偏移时保持原样">已锁定</span>
               <NInput
                 :value="labelValue(cue)"
                 size="small"
@@ -530,6 +545,15 @@ function channelFilterDuplicate(fixtureId: string): boolean {
           </div>
 
           <div class="cue-row__actions">
+            <NButton
+              size="tiny"
+              quaternary
+              :type="cue.locked ? 'warning' : 'default'"
+              :title="cue.locked ? '解除锁定，批量偏移时跟随调整' : '锁定后批量偏移保持原样'"
+              @click="toggleLock(cue)"
+            >
+              {{ cue.locked ? '解除锁定' : '锁定' }}
+            </NButton>
             <NButton size="tiny" quaternary :disabled="index === 0" @click="copyPrevious(cue)">沿用上一条</NButton>
             <NButton size="tiny" quaternary @click="duplicateCue(cue)">复制为新 Cue</NButton>
             <NButton size="tiny" quaternary :disabled="index === 0" @click="move(cue, -1)">上移</NButton>
@@ -585,7 +609,11 @@ function channelFilterDuplicate(fixtureId: string): boolean {
           <NSelect :value="shiftForm.scope" :options="scopeOptions" @update:value="handleScopeChange" />
         </NFormItem>
       </NForm>
-      <p class="shift-tip">将对本场全部 {{ cues.length }} 条 Cue 生效，结果下限为 0 秒。</p>
+      <p class="shift-tip">
+        将对本场 {{ cues.length - lockedCount }} 条未锁定 Cue 生效，结果下限为 0 秒；
+        {{ lockedCount > 0 ? `${lockedCount} 条已锁定保持原样，但仍按原值参与衔接校验。` : '当前没有锁定的 Cue。' }}
+        偏移后若出现渐暗 + 渐亮不足 1 秒的硬切衔接，本次偏移将整体不生效。
+      </p>
       <template #footer>
         <div class="modal-footer">
           <NButton @click="showShift = false">取消</NButton>
@@ -655,6 +683,22 @@ function channelFilterDuplicate(fixtureId: string): boolean {
 
 .cue-row--over {
   border-color: rgba(242, 181, 68, 0.75);
+}
+
+.cue-row--locked {
+  border-color: rgba(242, 181, 68, 0.38);
+  background: rgba(242, 181, 68, 0.04);
+}
+
+.cue-row__lock-badge {
+  flex: none;
+  align-self: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: #f2b544;
+  border: 1px solid rgba(242, 181, 68, 0.5);
+  background: rgba(242, 181, 68, 0.1);
 }
 
 .cue-row__lead {
